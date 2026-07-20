@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# robbie — start/stop/configure the desk-pet orchestrator from anywhere
+set -euo pipefail
+
+# Resolve symlinks so ~/bin/robbie still finds the project checkout
+_SOURCE="${BASH_SOURCE[0]}"
+while [[ -L "$_SOURCE" ]]; do
+  _DIR="$(cd -P "$(dirname "$_SOURCE")" && pwd)"
+  _LINK="$(readlink "$_SOURCE")"
+  if [[ "$_LINK" == /* ]]; then
+    _SOURCE="$_LINK"
+  else
+    _SOURCE="$_DIR/$_LINK"
+  fi
+done
+ROBBIE_ROOT="$(cd -P "$(dirname "$_SOURCE")/.." && pwd)"
+PYTHON="$ROBBIE_ROOT/.venv/bin/python"
+ORCH="$ROBBIE_ROOT/robbie_orchestrator.py"
+CONFIG_DIR="${HOME}/.config/robbie"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+VOICE_FILE="$CONFIG_DIR/voice_mode"
+PID_FILE="$CONFIG_DIR/robbie.pid"
+LOG_FILE="$CONFIG_DIR/robbie.log"
+
+mkdir -p "$CONFIG_DIR"
+
+die() { echo "robbie: $*" >&2; exit 1; }
+
+ensure_python() {
+  [[ -x "$PYTHON" ]] || die "venv python missing at $PYTHON — run: cd \"$ROBBIE_ROOT\" && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
+  [[ -f "$ORCH" ]] || die "orchestrator missing at $ORCH"
+}
+
+is_running() {
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "${pid:-}" ]] && kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+
+voice_is_on() {
+  [[ -f "$VOICE_FILE" ]] || return 1
+  local v
+  v="$(tr '[:upper:]' '[:lower:]' <"$VOICE_FILE" | tr -d '[:space:]')"
+  [[ "$v" == "on" || "$v" == "1" || "$v" == "true" || "$v" == "yes" ]]
+}
+
+cmd_set_key() {
+  local key="${1:-}"
+  if [[ -z "$key" ]]; then
+    die "usage: robbie set-key YOUR_GOOGLE_API_KEY"
+  fi
+  ensure_python
+  "$PYTHON" - "$CONFIG_FILE" "$key" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+key = sys.argv[2].strip()
+path.parent.mkdir(parents=True, exist_ok=True)
+data = {}
+if path.exists():
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        data = {}
+data["google_api_key"] = key
+path.write_text(json.dumps(data, indent=2) + "\n")
+path.chmod(0o600)
+print(f"Saved API key to {path}")
+PY
+}
+
+cmd_voice() {
+  local sub="${1:-}"
+  case "$sub" in
+    on)
+      echo "on" >"$VOICE_FILE"
+      echo "voice mode: ON (mic + Live conversation)"
+      if is_running; then
+        echo "running process will pick this up within ~1s"
+      else
+        echo "tip: start Robbie with: robbie start"
+      fi
+      ;;
+    off)
+      echo "off" >"$VOICE_FILE"
+      echo "voice mode: OFF (proactive / motion only — mic closed)"
+      if is_running; then
+        echo "running process will pick this up within ~1s"
+      fi
+      ;;
+    status|"")
+      if voice_is_on; then
+        echo "voice mode: ON"
+      else
+        echo "voice mode: OFF"
+      fi
+      if is_running; then
+        echo "orchestrator: running (pid $(cat "$PID_FILE"))"
+      else
+        echo "orchestrator: not running"
+      fi
+      ;;
+    *)
+      die "usage: robbie voice [on|off|status]"
+      ;;
+  esac
+}
+
+cmd_start() {
+  ensure_python
+  if is_running; then
+    echo "robbie already running (pid $(cat "$PID_FILE"))"
+    exit 0
+  fi
+  if [[ -n "${GOOGLE_API_KEY:-}" || -n "${GEMINI_API_KEY:-}" ]]; then
+    local k="${GOOGLE_API_KEY:-$GEMINI_API_KEY}"
+    cmd_set_key "$k" >/dev/null
+  fi
+  if [[ ! -f "$CONFIG_FILE" ]] && [[ -z "${GOOGLE_API_KEY:-}" && -z "${GEMINI_API_KEY:-}" ]]; then
+    die "no API key — run: robbie set-key YOUR_KEY"
+  fi
+  # Default to proactive-only until user enables voice
+  if [[ ! -f "$VOICE_FILE" ]]; then
+    echo "off" >"$VOICE_FILE"
+  fi
+  nohup "$PYTHON" "$ORCH" >>"$LOG_FILE" 2>&1 &
+  echo $! >"$PID_FILE"
+  echo "robbie started (pid $(cat "$PID_FILE"))"
+  if voice_is_on; then
+    echo "voice: ON — say hello to chat"
+  else
+    echo "voice: OFF — proactive motion only"
+    echo "enable chat anytime with: robbie voice on"
+  fi
+  echo "logs: $LOG_FILE"
+}
+
+cmd_stop() {
+  if ! is_running; then
+    echo "robbie is not running"
+    rm -f "$PID_FILE"
+    exit 0
+  fi
+  local pid
+  pid="$(cat "$PID_FILE")"
+  kill "$pid" 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.4
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$PID_FILE"
+  echo "robbie stopped"
+}
+
+cmd_status() {
+  if is_running; then
+    echo "robbie is running (pid $(cat "$PID_FILE"))"
+    echo "log: $LOG_FILE"
+  else
+    echo "robbie is not running"
+  fi
+  if voice_is_on; then
+    echo "voice mode: ON"
+  else
+    echo "voice mode: OFF"
+  fi
+  ensure_python
+  "$PYTHON" - <<'PY'
+import json
+from pathlib import Path
+cfg = Path.home() / ".config" / "robbie" / "config.json"
+mem = Path.home() / ".config" / "robbie" / "memory.json"
+voice = "Puck"
+if cfg.exists():
+    try:
+        voice = json.loads(cfg.read_text()).get("voice_name", "Puck")
+    except Exception:
+        pass
+print(f"speaking voice: {voice}")
+n = 0
+if mem.exists():
+    try:
+        n = len(json.loads(mem.read_text()).get("facts") or [])
+    except Exception:
+        pass
+print(f"memories: {n}")
+PY
+}
+
+cmd_set_voice() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "usage: robbie set-voice <Name>  (e.g. Puck, Aoede, Kore)"
+  ensure_python
+  (
+    cd "$ROBBIE_ROOT"
+    "$PYTHON" -c "from robbie_orchestrator import set_voice_name, VALID_VOICES
+import sys
+try:
+    v = set_voice_name(sys.argv[1])
+    print(f'speaking voice set to: {v}')
+    print('if Robbie is running with voice ON, Live will reconnect shortly')
+except ValueError as e:
+    print(e, file=sys.stderr)
+    print('examples:', ', '.join(VALID_VOICES[:8]), file=sys.stderr)
+    raise SystemExit(1)
+" "$name"
+  )
+}
+
+cmd_voices() {
+  ensure_python
+  (
+    cd "$ROBBIE_ROOT"
+    "$PYTHON" -c "from robbie_orchestrator import VALID_VOICES, get_voice_name
+print('Available voices:')
+print(', '.join(VALID_VOICES))
+print('current:', get_voice_name())
+"
+  )
+}
+
+cmd_memory() {
+  local sub="${1:-show}"
+  ensure_python
+  case "$sub" in
+    show|"")
+      "$PYTHON" - <<'PY'
+import json
+from pathlib import Path
+p = Path.home() / ".config" / "robbie" / "memory.json"
+if not p.exists():
+    print("(no memories yet)")
+    raise SystemExit(0)
+data = json.loads(p.read_text())
+facts = data.get("facts") or []
+if not facts:
+    print("(no memories yet)")
+else:
+    for i, f in enumerate(facts, 1):
+        if isinstance(f, dict):
+            print(f"{i}. {f.get('text','')}")
+PY
+      ;;
+    clear)
+      echo '{"facts":[]}' >"${HOME}/.config/robbie/memory.json"
+      echo "memories cleared"
+      ;;
+    *)
+      die "usage: robbie memory [show|clear]"
+      ;;
+  esac
+}
+
+cmd_run() {
+  ensure_python
+  if [[ -n "${GOOGLE_API_KEY:-}" || -n "${GEMINI_API_KEY:-}" ]]; then
+    cmd_set_key "${GOOGLE_API_KEY:-$GEMINI_API_KEY}" >/dev/null
+  fi
+  if [[ ! -f "$VOICE_FILE" ]]; then
+    echo "off" >"$VOICE_FILE"
+  fi
+  exec "$PYTHON" "$ORCH"
+}
+
+cmd_logs() {
+  touch "$LOG_FILE"
+  exec tail -n 100 -f "$LOG_FILE"
+}
+
+usage() {
+  cat <<EOF
+Usage: robbie <command>
+
+  set-key <KEY>        Save Google API key
+  start                Start in background (default: voice OFF)
+  stop                 Stop background process
+  status               Process + voice mode + speaking voice + memory count
+  voice on|off|status  Toggle Live mic conversation
+  set-voice <Name>     Change speaking voice (Puck, Aoede, Kore, …)
+  voices               List available voices
+  memory [show|clear]  Show or clear remembered facts
+  run                  Foreground mode
+  logs                 Tail background log
+  help                 This help
+
+Live can also call tools: move_robot, turn_voice_off, remember, set_voice.
+Brain cascade (fast-first): gemini-3.1-flash-lite → gemma-4-26b-a4b-it → gemma-4-31b-it
+In proactive mode, say "Robbie" to wake voice mode.
+Multilingual: speak Hindi/Chinese/English — Live mirrors your language.
+
+Config: $CONFIG_FILE
+Voice:  $VOICE_FILE
+Project: $ROBBIE_ROOT
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    set-key) cmd_set_key "${1:-}" ;;
+    start)   cmd_start ;;
+    stop)    cmd_stop ;;
+    status)  cmd_status ;;
+    voice)   cmd_voice "${1:-status}" ;;
+    set-voice) cmd_set_voice "${1:-}" ;;
+    voices)  cmd_voices ;;
+    memory)  cmd_memory "${1:-show}" ;;
+    run)     cmd_run ;;
+    logs)    cmd_logs ;;
+    help|-h|--help) usage ;;
+    *) die "unknown command '$cmd' (try: robbie help)" ;;
+  esac
+}
+
+main "$@"
