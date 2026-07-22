@@ -50,6 +50,26 @@ voice_is_on() {
   [[ "$v" == "on" || "$v" == "1" || "$v" == "true" || "$v" == "yes" ]]
 }
 
+cmd_set_bridge() {
+  local url="${1:-}"
+  if [[ -z "$url" ]]; then
+    die "usage: robbie set-bridge http://ESP32_IP/robot"
+  fi
+  ensure_python
+  (
+    cd "$ROBBIE_ROOT"
+    "$PYTHON" -c "from robbie_orchestrator import set_bridge_url
+import sys
+try:
+    u = set_bridge_url(sys.argv[1])
+    print(f'bridge URL set to: {u}')
+except ValueError as e:
+    print(e, file=sys.stderr)
+    raise SystemExit(1)
+" "$url"
+  )
+}
+
 cmd_set_key() {
   local key="${1:-}"
   if [[ -z "$key" ]]; then
@@ -182,12 +202,16 @@ from pathlib import Path
 cfg = Path.home() / ".config" / "robbie" / "config.json"
 mem = Path.home() / ".config" / "robbie" / "memory.json"
 voice = "Puck"
+bridge = "(default)"
 if cfg.exists():
     try:
-        voice = json.loads(cfg.read_text()).get("voice_name", "Puck")
+        data = json.loads(cfg.read_text())
+        voice = data.get("voice_name", "Puck")
+        bridge = data.get("bridge_url", "http://192.168.4.1/robot")
     except Exception:
         pass
 print(f"speaking voice: {voice}")
+print(f"bridge URL: {bridge}")
 n = 0
 if mem.exists():
     try:
@@ -283,6 +307,7 @@ usage() {
 Usage: robbie <command>
 
   set-key <KEY>        Save Google API key
+  set-bridge <URL>     Save ESP32 HTTP bridge URL (e.g. http://192.168.4.1/robot)
   start                Start in background (default: voice OFF)
   stop                 Stop background process
   status               Process + voice mode + speaking voice + memory count
@@ -295,7 +320,9 @@ Usage: robbie <command>
   help                 This help
 
 Live can also call tools: move_robot, turn_voice_off, remember, set_voice.
+Motion + speech WAV POST to ESP32-S3 via HTTP bridge (see bridge_test.py).
 Brain cascade (fast-first): gemini-3.1-flash-lite → gemma-4-26b-a4b-it → gemma-4-31b-it
+(Pi Zero uses flash-lite only when ROBBIE_PI=1 or armv6l/armv7l.)
 In proactive mode, say "Robbie" to wake voice mode.
 Multilingual: speak Hindi/Chinese/English — Live mirrors your language.
 
@@ -310,6 +337,7 @@ main() {
   shift || true
   case "$cmd" in
     set-key) cmd_set_key "${1:-}" ;;
+    set-bridge) cmd_set_bridge "${1:-}" ;;
     start)   cmd_start ;;
     stop)    cmd_stop ;;
     status)  cmd_status ;;

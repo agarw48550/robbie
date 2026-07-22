@@ -4,6 +4,10 @@
 Concurrent work:
   1. Gemini Live voice (tools: move, voice-off, remember, set voice)
   2. Background brain with model cascade for motion when Live does not tool-call
+  3. HTTP POST bridge to ESP32-S3 (motion + base64 WAV audio)
+
+Pi Zero W (512MB RAM): set ROBBIE_PI=1 or run on armv6l/armv7l for slim mode.
+Recommend 512MB swap or zram — Live + sounddevice peaks ~350–450MB RSS.
 """
 
 from __future__ import annotations
@@ -14,10 +18,14 @@ import io
 import json
 import logging
 import os
+import platform
 import queue as std_queue
 import random
 import re
+import struct
 import time
+import urllib.error
+import urllib.request
 import wave
 from collections import deque
 from dataclasses import dataclass, field
@@ -25,8 +33,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import numpy as np
-import serial
 import sounddevice as sd
 from google import genai
 from google.genai import types
@@ -40,17 +46,29 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 VOICE_MODE_PATH = CONFIG_DIR / "voice_mode"  # "on" | "off"
 MEMORY_PATH = CONFIG_DIR / "memory.json"
 
-SERIAL_PORT = "/dev/cu.usbmodem102"
-BAUD_RATE = 115200
-SERIAL_SETTLE_S = 2.0
+DEFAULT_BRIDGE_URL = "http://192.168.4.1/robot"
+DEFAULT_BRIDGE_TIMEOUT_S = 5.0
 
 LIVE_MODEL = "gemini-3.1-flash-live-preview"
-# Fast-first cascade so motion keeps up with Live speech
-BRAIN_MODELS = [
+BRAIN_MODELS_FULL = [
     "gemini-3.1-flash-lite",
     "gemma-4-26b-a4b-it",
     "gemma-4-31b-it",
 ]
+BRAIN_MODELS_PI = ["gemini-3.1-flash-lite"]
+
+
+def is_pi_zero() -> bool:
+    if os.environ.get("ROBBIE_PI") == "1":
+        return True
+    return platform.machine() in ("armv6l", "armv7l")
+
+
+IS_PI = is_pi_zero()
+BRAIN_MODELS = BRAIN_MODELS_PI if IS_PI else BRAIN_MODELS_FULL
+TURN_AUDIO_MAX_BYTES = 384_000  # ~8s @ 24 kHz mono 16-bit
+MIC_QUEUE_SIZE = 16 if IS_PI else 32
+PLAY_QUEUE_SIZE = 64 if IS_PI else 256
 PROACTIVITY_INTERVAL_S = 60.0
 
 INPUT_SAMPLE_RATE = 16_000
@@ -106,6 +124,25 @@ EXPR_NAME_TO_DIGIT = {
     "6": "6", "7": "7", "8": "8", "9": "9",
 }
 
+DIGIT_TO_DIR = {
+    "1": "forward",
+    "2": "backward",
+    "3": "spin_left",
+    "4": "spin_right",
+}
+
+DIGIT_TO_EXPR = {
+    "1": "happy",
+    "2": "sad",
+    "3": "curious",
+    "4": "angry",
+    "5": "calm",
+    "6": "surprised",
+    "7": "love",
+    "8": "silly",
+    "9": "worried",
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -153,6 +190,27 @@ def get_voice_name() -> str:
     if isinstance(name, str) and name in VALID_VOICES:
         return name
     return "Puck"
+
+
+def set_bridge_url(url: str) -> str:
+    cleaned = url.strip()
+    if not cleaned:
+        raise ValueError("bridge URL cannot be empty")
+    cfg = load_config()
+    cfg["bridge_url"] = cleaned
+    if "bridge_timeout_s" not in cfg:
+        cfg["bridge_timeout_s"] = DEFAULT_BRIDGE_TIMEOUT_S
+    save_config(cfg)
+    return cleaned
+
+
+def load_bridge_config() -> dict[str, Any]:
+    cfg = load_config()
+    return {
+        "bridge_url": cfg.get("bridge_url", DEFAULT_BRIDGE_URL),
+        "bridge_timeout_s": float(cfg.get("bridge_timeout_s", DEFAULT_BRIDGE_TIMEOUT_S)),
+        "bridge_token": (cfg.get("bridge_token") or "").strip(),
+    }
 
 
 def set_voice_name(name: str) -> str:
@@ -280,7 +338,7 @@ class SharedState:
     last_user_transcript: str = ""
     last_model_transcript: str = ""
     live_session: Any = None
-    serial_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    bridge_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     brain_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     voice_enabled: asyncio.Event = field(default_factory=asyncio.Event)
@@ -291,23 +349,44 @@ class SharedState:
     brain_model_index: int = 0
     voice_name: str = "Puck"
     force_live_reconnect: bool = False
-    recent_serials: deque[str] = field(default_factory=lambda: deque(maxlen=8))
+    recent_actions: deque[str] = field(default_factory=lambda: deque(maxlen=8))
+    turn_audio_pcm: bytearray = field(default_factory=bytearray)
     client: Any = None
-    ser: Optional[serial.Serial] = None
     reactive_brain_task: Optional[asyncio.Task] = None
 
 
 # ---------------------------------------------------------------------------
-# Serial helpers
+# WAV / audio helpers
 # ---------------------------------------------------------------------------
 
-def open_serial() -> serial.Serial:
-    log.info("Opening serial %s @ %d", SERIAL_PORT, BAUD_RATE)
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(SERIAL_SETTLE_S)
-    log.info("Serial connection ready")
-    return ser
+def pcm16_to_wav_bytes(pcm: bytes, rate: int = OUTPUT_SAMPLE_RATE) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
 
+
+def encode_audio_wav_b64(pcm: bytes, rate: int = OUTPUT_SAMPLE_RATE) -> Optional[str]:
+    if not pcm:
+        return None
+    wav = pcm16_to_wav_bytes(pcm, rate=rate)
+    return base64.b64encode(wav).decode("ascii")
+
+
+def append_turn_audio(shared: SharedState, pcm: bytes) -> None:
+    if not pcm:
+        return
+    shared.turn_audio_pcm.extend(pcm)
+    if len(shared.turn_audio_pcm) > TURN_AUDIO_MAX_BYTES:
+        del shared.turn_audio_pcm[: len(shared.turn_audio_pcm) - TURN_AUDIO_MAX_BYTES]
+
+
+# ---------------------------------------------------------------------------
+# HTTP bridge helpers
+# ---------------------------------------------------------------------------
 
 def is_valid_serial_command(cmd: Optional[str]) -> bool:
     return isinstance(cmd, str) and bool(SERIAL_COMMAND_RE.fullmatch(cmd))
@@ -336,29 +415,142 @@ def build_serial_command(
     return f"{d}{dur}{spd}{expr}"
 
 
-async def send_serial_command(shared: SharedState, cmd: str) -> bool:
+def serial_command_to_action(cmd: str) -> Optional[dict[str, Any]]:
     if not is_valid_serial_command(cmd):
+        return None
+    return {
+        "direction": DIGIT_TO_DIR[cmd[0]],
+        "duration_seconds": int(cmd[1]),
+        "speed": int(cmd[2]),
+        "expression": DIGIT_TO_EXPR[cmd[3]],
+    }
+
+
+def build_robot_action(
+    direction: str,
+    duration_seconds: int | float | str,
+    speed: int | float | str = 5,
+    expression: str | int = "curious",
+) -> Optional[dict[str, Any]]:
+    cmd = build_serial_command(direction, duration_seconds, speed, expression)
+    if not cmd:
+        return None
+    return serial_command_to_action(cmd)
+
+
+def action_key(action: dict[str, Any]) -> str:
+    d = {"forward": "1", "backward": "2", "spin_left": "3", "spin_right": "4"}[
+        action["direction"]
+    ]
+    e = EXPR_NAME_TO_DIGIT[action["expression"]]
+    return f"{d}{action['duration_seconds']}{action['speed']}{e}"
+
+
+def _post_json_sync(url: str, body: bytes, timeout_s: float, token: str) -> bool:
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return 200 <= resp.status < 300
+    except urllib.error.HTTPError as exc:
+        log.error("Bridge POST HTTP %s: %s", exc.code, exc.reason)
+        return False
+    except urllib.error.URLError as exc:
+        log.error("Bridge POST failed: %s", exc.reason)
+        return False
+    except Exception as exc:
+        log.error("Bridge POST failed: %s", exc)
+        return False
+
+
+async def send_robot_action(
+    shared: SharedState,
+    *,
+    direction: str,
+    duration_seconds: int,
+    speed: int,
+    expression: str,
+    source: str,
+    transcript: str = "",
+    include_audio: bool = True,
+) -> bool:
+    action = build_robot_action(direction, duration_seconds, speed, expression)
+    if not action:
+        log.warning("Rejected invalid robot action: %r", (direction, duration_seconds, speed, expression))
+        return False
+
+    bridge = load_bridge_config()
+    if not bridge["bridge_url"]:
+        log.warning("robot action skipped — no bridge_url configured")
+        return False
+
+    async with shared.bridge_lock:
+        audio_b64: Optional[str] = None
+        if include_audio and shared.turn_audio_pcm:
+            pcm = bytes(shared.turn_audio_pcm)
+            shared.turn_audio_pcm.clear()
+            audio_b64 = encode_audio_wav_b64(pcm)
+
+        payload = {
+            "direction": action["direction"],
+            "duration_seconds": action["duration_seconds"],
+            "speed": action["speed"],
+            "expression": action["expression"],
+            "audio": audio_b64,
+            "audio_format": "wav",
+            "sample_rate": OUTPUT_SAMPLE_RATE,
+            "transcript": (transcript or "")[:500],
+            "source": source,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        body = json.dumps(payload).encode("utf-8")
+        ok = await asyncio.to_thread(
+            _post_json_sync,
+            bridge["bridge_url"],
+            body,
+            bridge["bridge_timeout_s"],
+            bridge["bridge_token"],
+        )
+
+    if ok:
+        shared.recent_actions.append(action_key(action))
+        log.info(
+            "Bridge POST ok: %s source=%s audio=%s",
+            action_key(action),
+            source,
+            "yes" if audio_b64 else "no",
+        )
+    return ok
+
+
+async def send_robot_action_from_serial(
+    shared: SharedState,
+    cmd: str,
+    *,
+    source: str,
+    transcript: str = "",
+    include_audio: bool = True,
+) -> bool:
+    action = serial_command_to_action(cmd)
+    if not action:
         log.warning("Rejected invalid serial_command: %r", cmd)
         return False
-    ser = shared.ser
-    if ser is None:
-        log.warning("serial_command %s skipped — no serial port", cmd)
-        return False
-    payload = f"{cmd}\n".encode("ascii")
-    async with shared.serial_lock:
-        try:
-            await asyncio.to_thread(ser.write, payload)
-            await asyncio.to_thread(ser.flush)
-            shared.recent_serials.append(cmd)
-            log.info("Sent serial command: %s", cmd)
-            return True
-        except serial.SerialException as exc:
-            log.error("Serial write failed: %s", exc)
-            return False
+    return await send_robot_action(
+        shared,
+        direction=action["direction"],
+        duration_seconds=action["duration_seconds"],
+        speed=action["speed"],
+        expression=action["expression"],
+        source=source,
+        transcript=transcript,
+        include_audio=include_audio,
+    )
 
 
 def pick_fallback_serial(shared: SharedState) -> str:
-    recent = set(shared.recent_serials)
+    recent = set(shared.recent_actions)
     choices = [c for c in FALLBACK_SERIAL_POOL if c not in recent] or list(FALLBACK_SERIAL_POOL)
     return random.choice(choices)
 
@@ -480,17 +672,25 @@ async def handle_live_tool(
 ) -> dict[str, Any]:
     args = dict(args or {})
     if name == "move_robot":
-        cmd = build_serial_command(
+        action = build_robot_action(
             direction=args.get("direction", ""),
             duration_seconds=args.get("duration_seconds", 2),
             speed=args.get("speed", 5),
             expression=args.get("expression", "curious"),
         )
-        if not cmd:
+        if not action:
             return {"ok": False, "error": "invalid movement args"}
-        ok = await send_serial_command(shared, cmd)
+        ok = await send_robot_action(
+            shared,
+            direction=action["direction"],
+            duration_seconds=action["duration_seconds"],
+            speed=action["speed"],
+            expression=action["expression"],
+            source="live_tool",
+            transcript=shared.last_model_transcript,
+        )
         shared.tool_moved_this_turn = True
-        return {"ok": ok, "serial_command": cmd}
+        return {"ok": ok, "action": action}
 
     if name == "turn_voice_off":
         write_voice_mode_file(False)
@@ -621,7 +821,12 @@ def parse_brain_response(raw_text: Optional[str]) -> Optional[dict[str, Any]]:
     return data
 
 
-async def execute_brain_decision(shared: SharedState, decision: dict[str, Any]) -> None:
+async def execute_brain_decision(
+    shared: SharedState,
+    decision: dict[str, Any],
+    *,
+    source: str = "brain_reactive",
+) -> None:
     log.info(
         "Brain decision: should_act=%s action_type=%s serial=%r",
         decision["should_act"],
@@ -631,7 +836,14 @@ async def execute_brain_decision(shared: SharedState, decision: dict[str, Any]) 
     if not decision["should_act"] or decision["action_type"] == "none":
         return
     if decision["serial_command"]:
-        await send_serial_command(shared, decision["serial_command"])
+        include_audio = source == "brain_reactive"
+        await send_robot_action_from_serial(
+            shared,
+            decision["serial_command"],
+            source=source,
+            transcript=shared.last_model_transcript if include_audio else "",
+            include_audio=include_audio,
+        )
     social_note = decision.get("social_note")
     if social_note and shared.voice_enabled.is_set() and shared.live_session is not None:
         try:
@@ -658,6 +870,7 @@ async def call_brain(
     prompt: str,
     reason: str,
     *,
+    source: str = "brain_reactive",
     fallback_serial: Optional[str] = None,
 ) -> None:
     client = shared.client
@@ -686,7 +899,7 @@ async def call_brain(
                         log.warning("Unusable JSON from %s", model)
                         break
                     shared.brain_model_index = idx  # stick to working model
-                    await execute_brain_decision(shared, decision)
+                    await execute_brain_decision(shared, decision, source=source)
                     return
                 except Exception as exc:
                     last_exc = exc
@@ -703,7 +916,14 @@ async def call_brain(
         )
         if fallback_serial and is_valid_serial_command(fallback_serial):
             log.info("Using fallback serial: %s", fallback_serial)
-            await send_serial_command(shared, fallback_serial)
+            include_audio = source == "brain_reactive"
+            await send_robot_action_from_serial(
+                shared,
+                fallback_serial,
+                source=source,
+                transcript=shared.last_model_transcript if include_audio else "",
+                include_audio=include_audio,
+            )
 
 
 def schedule_reactive_brain(shared: SharedState, user_t: str, model_t: str) -> None:
@@ -715,7 +935,14 @@ def schedule_reactive_brain(shared: SharedState, user_t: str, model_t: str) -> N
 
     now = time.monotonic()
     if now - shared.last_reactive_brain_at < REACTIVE_BRAIN_MIN_INTERVAL_S:
-        asyncio.create_task(send_serial_command(shared, pick_fallback_serial(shared)))
+        asyncio.create_task(
+            send_robot_action_from_serial(
+                shared,
+                pick_fallback_serial(shared),
+                source="brain_reactive",
+                transcript=shared.last_model_transcript,
+            )
+        )
         shared.brain_scheduled_this_turn = True
         return
 
@@ -725,7 +952,7 @@ def schedule_reactive_brain(shared: SharedState, user_t: str, model_t: str) -> N
     if prev and not prev.done():
         prev.cancel()
 
-    recent = list(shared.recent_serials)
+    recent = list(shared.recent_actions)
 
     async def _run() -> None:
         try:
@@ -733,6 +960,7 @@ def schedule_reactive_brain(shared: SharedState, user_t: str, model_t: str) -> N
                 shared,
                 build_brain_prompt_reactive(user_t, model_t, recent),
                 reason="per-response",
+                source="brain_reactive",
                 fallback_serial=pick_fallback_serial(shared),
             )
         except asyncio.CancelledError:
@@ -782,31 +1010,38 @@ async def control_watcher(shared: SharedState) -> None:
 # ---------------------------------------------------------------------------
 
 def _chunk_rms(pcm: bytes) -> float:
-    if not pcm:
+    if not pcm or len(pcm) < 2:
         return 0.0
-    arr = np.frombuffer(pcm, dtype=np.int16)
-    if arr.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean(arr.astype(np.float64) ** 2)))
+    try:
+        import audioop
+
+        return float(audioop.rms(pcm, 2))
+    except ImportError:
+        count = len(pcm) // 2
+        samples = struct.unpack(f"<{count}h", pcm[: count * 2])
+        if not samples:
+            return 0.0
+        ss = sum(s * s for s in samples)
+        return (ss / len(samples)) ** 0.5
 
 
 async def _mic_send_loop(session: Any, shared: SharedState) -> None:
     loop = asyncio.get_running_loop()
-    audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=32)
+    audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=MIC_QUEUE_SIZE)
 
-    def _callback(indata: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
+    def _callback(indata: Any, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
         if status:
             log.debug("Mic status: %s", status)
-        pcm = (indata[:, 0] * 32767.0).astype(np.int16).tobytes()
+        pcm = bytes(indata)
         try:
             loop.call_soon_threadsafe(audio_queue.put_nowait, pcm)
         except asyncio.QueueFull:
             pass
 
-    stream = sd.InputStream(
+    stream = sd.RawInputStream(
         samplerate=INPUT_SAMPLE_RATE,
         channels=CHANNELS,
-        dtype="float32",
+        dtype="int16",
         blocksize=CHUNK_FRAMES,
         callback=_callback,
     )
@@ -843,7 +1078,7 @@ async def _mic_send_loop(session: Any, shared: SharedState) -> None:
 
 
 async def _receive_loop(session: Any, shared: SharedState) -> None:
-    play_q: std_queue.Queue[Optional[bytes]] = std_queue.Queue(maxsize=256)
+    play_q: std_queue.Queue[Optional[bytes]] = std_queue.Queue(maxsize=PLAY_QUEUE_SIZE)
 
     def _play_worker() -> None:
         with sd.RawOutputStream(
@@ -873,6 +1108,7 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
             turn_had_user = False
             shared.tool_moved_this_turn = False
             shared.brain_scheduled_this_turn = False
+            shared.turn_audio_pcm.clear()
 
             async for response in session.receive():
                 if (
@@ -943,6 +1179,7 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
                             audio_bytes = inline.data
                             if isinstance(audio_bytes, str):
                                 audio_bytes = base64.b64decode(audio_bytes)
+                            append_turn_audio(shared, audio_bytes)
                             try:
                                 play_q.put_nowait(audio_bytes)
                             except std_queue.Full:
@@ -951,6 +1188,7 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
                 if getattr(content, "interrupted", False):
                     log.info("Model interrupted — clearing playback")
                     shared.is_playing = False
+                    shared.turn_audio_pcm.clear()
                     while not play_q.empty():
                         try:
                             play_q.get_nowait()
@@ -977,6 +1215,7 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
 
                     shared.tool_moved_this_turn = False
                     shared.brain_scheduled_this_turn = False
+                    shared.turn_audio_pcm.clear()
     finally:
         shared.is_playing = False
         play_q.put(None)
@@ -1097,16 +1336,6 @@ async def live_conversation_task(shared: SharedState) -> None:
 # Wake word ("robbie") while proactive-only
 # ---------------------------------------------------------------------------
 
-def pcm16_to_wav_bytes(pcm: bytes, rate: int = INPUT_SAMPLE_RATE) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        wf.writeframes(pcm)
-    return buf.getvalue()
-
-
 WAKE_PATTERNS = re.compile(
     r"\b(hey\s+)?robbie\b|\bरॉबी\b|\bरोबी\b|罗比|羅比",
     re.IGNORECASE,
@@ -1151,16 +1380,16 @@ async def wake_word_task(shared: SharedState) -> None:
     audio_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
     last_wake = 0.0
 
-    def _callback(indata: np.ndarray, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
+    def _callback(indata: Any, frames: int, time_info: Any, status: sd.CallbackFlags) -> None:
         if status:
             log.debug("Wake mic status: %s", status)
-        pcm = (indata[:, 0] * 32767.0).astype(np.int16).tobytes()
+        pcm = bytes(indata)
         try:
             loop.call_soon_threadsafe(audio_q.put_nowait, pcm)
         except asyncio.QueueFull:
             pass
 
-    stream: Optional[sd.InputStream] = None
+    stream: Optional[sd.RawInputStream] = None
 
     try:
         while not shared.shutdown.is_set():
@@ -1175,10 +1404,10 @@ async def wake_word_task(shared: SharedState) -> None:
                 continue
 
             if stream is None:
-                stream = sd.InputStream(
+                stream = sd.RawInputStream(
                     samplerate=INPUT_SAMPLE_RATE,
                     channels=CHANNELS,
-                    dtype="float32",
+                    dtype="int16",
                     blocksize=CHUNK_FRAMES,
                     callback=_callback,
                 )
@@ -1219,7 +1448,7 @@ async def wake_word_task(shared: SharedState) -> None:
             if time.monotonic() - last_wake < WAKE_COOLDOWN_S:
                 continue
 
-            wav = pcm16_to_wav_bytes(bytes(clip))
+            wav = pcm16_to_wav_bytes(bytes(clip), rate=INPUT_SAMPLE_RATE)
             hit = await _clip_contains_wake_word(shared.client, wav)
             if hit:
                 last_wake = time.monotonic()
@@ -1227,7 +1456,17 @@ async def wake_word_task(shared: SharedState) -> None:
                 write_voice_mode_file(True)
                 shared.voice_enabled.set()
                 # Tiny acknowledgment motion
-                await send_serial_command(shared, pick_fallback_serial(shared))
+                fallback = serial_command_to_action(pick_fallback_serial(shared))
+                if fallback:
+                    await send_robot_action(
+                        shared,
+                        direction=fallback["direction"],
+                        duration_seconds=fallback["duration_seconds"],
+                        speed=fallback["speed"],
+                        expression=fallback["expression"],
+                        source="wake",
+                        include_audio=False,
+                    )
 
     finally:
         if stream is not None:
@@ -1254,7 +1493,7 @@ async def proactivity_task(shared: SharedState) -> None:
             pass
 
         idle_seconds = time.monotonic() - shared.last_interaction_time
-        recent = list(shared.recent_serials)
+        recent = list(shared.recent_actions)
         log.info(
             "Proactivity tick — idle=%.1fs voice=%s brain=%s",
             idle_seconds,
@@ -1267,6 +1506,7 @@ async def proactivity_task(shared: SharedState) -> None:
                 idle_seconds, shared.voice_enabled.is_set(), recent
             ),
             reason="idle",
+            source="brain_idle",
             fallback_serial=pick_fallback_serial(shared) if idle_seconds >= 45 else None,
         )
 
@@ -1293,6 +1533,10 @@ async def main() -> None:
     if "voice_name" not in cfg:
         cfg["voice_name"] = "Puck"
         save_config(cfg)
+    if "bridge_url" not in cfg:
+        cfg["bridge_url"] = DEFAULT_BRIDGE_URL
+        cfg["bridge_timeout_s"] = DEFAULT_BRIDGE_TIMEOUT_S
+        save_config(cfg)
     if not VOICE_MODE_PATH.exists():
         write_voice_mode_file(False)
     if not MEMORY_PATH.exists():
@@ -1302,10 +1546,10 @@ async def main() -> None:
     shared.client = genai.Client(api_key=api_key)
     shared.voice_name = get_voice_name()
 
-    try:
-        shared.ser = open_serial()
-    except serial.SerialException as exc:
-        log.error("Could not open serial port (%s). Continuing without hardware.", exc)
+    bridge = load_bridge_config()
+    log.info("HTTP bridge target: %s", bridge["bridge_url"])
+    if IS_PI:
+        log.info("Pi Zero slim mode: brain=%s mic_q=%d play_q=%d", BRAIN_MODELS, MIC_QUEUE_SIZE, PLAY_QUEUE_SIZE)
 
     watcher = asyncio.create_task(control_watcher(shared), name="control")
     live_task = asyncio.create_task(live_conversation_task(shared), name="live")
@@ -1324,12 +1568,6 @@ async def main() -> None:
         await asyncio.gather(
             watcher, live_task, brain_task, wake_task, return_exceptions=True
         )
-        if shared.ser is not None and shared.ser.is_open:
-            try:
-                shared.ser.close()
-                log.info("Serial port closed")
-            except serial.SerialException as exc:
-                log.error("Error closing serial: %s", exc)
 
 
 if __name__ == "__main__":

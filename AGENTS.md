@@ -13,9 +13,11 @@
 
 ## Learned Workspace Facts
 
-- Robbie is a desk-pet robot: Mac (Python 3.12+, asyncio) is the brain; a micro:bit USB relay executes motion/expression commands.
-- Configured relay serial port is `/dev/cu.usbmodem102` at 115200 baud; commands are a strict 4-digit newline-terminated string (e.g. `1491\n`).
-- 4-digit protocol: digit1 direction (1 F / 2 B / 3 spin L / 4 spin R), digit2 duration seconds 0–9, digit3 speed 1–9 (10%–90%), digit4 expression 1–9 (happy/sad/curious/angry/calm/surprised/love/silly/worried).
-- Main orchestrator is `robbie_orchestrator.py`; `Serial_test.py` is the serial smoke test; use the project `.venv` (system Python blocks pip).
-- Architecture: Gemini Live for conversation plus a fast text model for motion JSON (prefer Gemma 4 26B, fall back to Gemini 3.1 Flash Lite on failure/rate limits).
-- Dependencies center on `google-genai`, `pyserial`, and `asyncio` (see `requirements.txt`).
+- Robbie is a desk-pet robot: Raspberry Pi Zero W (Python 3.11+, asyncio) is the AI brain; an ESP32-S3 over WiFi executes motion, expression, and plays speech audio.
+- HTTP bridge default: `http://192.168.4.1/robot` (configure with `robbie set-bridge <URL>` in `~/.config/robbie/config.json`).
+- POST JSON payload fields: `direction`, `duration_seconds` (0–9), `speed` (1–9), `expression`, `audio` (base64 WAV from Gemini Live at 24 kHz mono, or null), `transcript`, `source`, `ts`.
+- Direction values: `forward | backward | spin_left | spin_right`. Expression values: `happy | sad | curious | angry | calm | surprised | love | silly | worried`.
+- Internal brain still uses 4-digit serial codes for planning; orchestrator converts to structured JSON before POST.
+- Main orchestrator is `robbie_orchestrator.py`; `bridge_test.py` is the HTTP smoke test; use the project `.venv`.
+- Architecture: Gemini Live for conversation plus a fast text model for motion JSON (full cascade on dev; Pi Zero uses `gemini-3.1-flash-lite` only via `ROBBIE_PI=1` or armv6l/armv7l detection).
+- Dependencies: `google-genai`, `sounddevice` (see `requirements.txt`). Pi Zero: recommend 512MB swap/zram; audio buffer capped at ~8s.
