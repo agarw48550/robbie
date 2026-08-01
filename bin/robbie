@@ -15,7 +15,7 @@ while [[ -L "$_SOURCE" ]]; do
 done
 ROBBIE_ROOT="$(cd -P "$(dirname "$_SOURCE")/.." && pwd)"
 PYTHON="$ROBBIE_ROOT/.venv/bin/python"
-ORCH="$ROBBIE_ROOT/robbie_orchestrator.py"
+ORCH="$ROBBIE_ROOT/main.py"
 CONFIG_DIR="${HOME}/.config/robbie"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 VOICE_FILE="$CONFIG_DIR/voice_mode"
@@ -28,7 +28,7 @@ die() { echo "robbie: $*" >&2; exit 1; }
 
 ensure_python() {
   [[ -x "$PYTHON" ]] || die "venv python missing at $PYTHON — run: cd \"$ROBBIE_ROOT\" && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt"
-  [[ -f "$ORCH" ]] || die "orchestrator missing at $ORCH"
+  [[ -f "$ORCH" ]] || die "entry point missing at $ORCH"
 }
 
 is_running() {
