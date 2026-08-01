@@ -18,7 +18,10 @@ from config.settings import (
     VOICE_MODE_PATH,
     log,
 )
+from src.command_bus import CommandBus
 from src.control import control_watcher
+from src.emotion_engine import EmotionEngine
+from src.events import EventBus
 from src.live import live_conversation_task
 from src.persistence import (
     get_voice_name,
@@ -30,6 +33,8 @@ from src.persistence import (
     write_voice_mode_file,
 )
 from src.proactivity import proactivity_task
+from src.robot_state import RobotState, RobotStateMachine
+from src.scheduler import Scheduler
 from src.state import SharedState
 from src.wake import wake_word_task
 
@@ -63,6 +68,23 @@ async def main() -> None:
     shared.client = genai.Client(api_key=api_key)
     shared.voice_name = get_voice_name()
 
+    # --- Event-driven OS layer (before Live AI) ---
+    event_bus = EventBus()
+    scheduler = Scheduler(event_bus)
+    emotion_engine = EmotionEngine(event_bus)
+    command_bus = CommandBus(event_bus, shared)
+    state_machine = RobotStateMachine(event_bus, RobotState.BOOTING)
+
+    shared.event_bus = event_bus
+    shared.scheduler = scheduler
+    shared.emotion_engine = emotion_engine
+    shared.command_bus = command_bus
+    shared.state_machine = state_machine
+
+    bus_task = asyncio.create_task(event_bus.run(), name="event_bus")
+    scheduler_task = asyncio.create_task(scheduler.run(), name="scheduler")
+    await state_machine.set_state(RobotState.IDLE, reason="boot_complete")
+
     bridge = load_bridge_config()
     log.info("HTTP bridge target: %s", bridge["bridge_url"])
     if IS_PI:
@@ -80,8 +102,16 @@ async def main() -> None:
     finally:
         shared.shutdown.set()
         shared.voice_enabled.set()
-        for task in (watcher, live_task, brain_task, wake_task):
+        scheduler.stop()
+        await event_bus.stop()
+        for task in (watcher, live_task, brain_task, wake_task, bus_task, scheduler_task):
             task.cancel()
         await asyncio.gather(
-            watcher, live_task, brain_task, wake_task, return_exceptions=True
+            watcher,
+            live_task,
+            brain_task,
+            wake_task,
+            bus_task,
+            scheduler_task,
+            return_exceptions=True,
         )

@@ -20,5 +20,6 @@
 - Internal brain still uses 4-digit serial codes for planning; orchestrator converts to structured JSON before POST.
 - Main entry point is `main.py` (modules under `src/`); `robbie_orchestrator.py` is a deprecated re-export shim. HTTP smoke test: `tools/bridge_test.py`. ESP32/K10 body firmware: `robot/k10_body.py`. Use the project `.venv`.
 - Layout: `config/` (constants), `src/` (brain/Live/bridge), `robot/` (ESP32), `tools/`, `tests/`, `assets/`, `docs/`.
+- Event-driven OS layer (architecture): `EventBus` (`src/events.py`), `RobotState` (`src/robot_state.py`), `EmotionEngine`, `actions`, `Scheduler`, `CommandBus` — initialised in `src/app.py` before Live AI; body POSTs still go through CommandBus with the same ESP32 JSON.
 - Architecture: Gemini Live for conversation plus a fast text model for motion JSON (full cascade on dev; Pi Zero uses `gemini-3.1-flash-lite` only via `ROBBIE_PI=1` or armv6l/armv7l detection).
 - Dependencies: `google-genai`, `sounddevice` (see `requirements.txt`). Pi Zero: recommend 512MB swap/zram; audio buffer capped at ~8s.

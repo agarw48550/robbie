@@ -6,7 +6,14 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from src.command_bus import CommandBus
+    from src.emotion_engine import EmotionEngine
+    from src.events import EventBus
+    from src.robot_state import RobotStateMachine
+    from src.scheduler import Scheduler
 
 
 @dataclass
@@ -30,3 +37,9 @@ class SharedState:
     turn_audio_pcm: bytearray = field(default_factory=bytearray)
     client: Any = None
     reactive_brain_task: Optional[asyncio.Task] = None
+    # Event-driven OS layer (attached in app.py before Live AI)
+    event_bus: Optional["EventBus"] = None
+    scheduler: Optional["Scheduler"] = None
+    emotion_engine: Optional["EmotionEngine"] = None
+    command_bus: Optional["CommandBus"] = None
+    state_machine: Optional["RobotStateMachine"] = None
