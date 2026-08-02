@@ -26,7 +26,7 @@ def send_to_k10(audio_bytes):
     )
     
     try:
-        with urllib.request.urlopen(req, timeout=3) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             print(f" -> Echoed {len(audio_bytes)} bytes back to K10 speaker successfully!")
     except Exception as e:
         print(f" -> Failed to send HTTP back to K10: {e}")
@@ -34,7 +34,6 @@ def send_to_k10(audio_bytes):
 def main():
     print("--- K10 Audio Echo Test ---")
     print(f"Targeting K10 HTTP at: {K10_HTTP_URL}")
-    print(f"Attempting to listen on UDP port {UDP_PORT}...")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -45,7 +44,6 @@ def main():
         print("Waiting for audio packets from K10 mic...\n")
     except Exception as e:
         print(f"ERROR: Could not bind to port {UDP_PORT}: {e}")
-        print("Run 'killall python3' to free the port.")
         sys.exit(1)
 
     chunk_count = 0
@@ -56,7 +54,7 @@ def main():
                 chunk_count += 1
                 print(f"[Chunk #{chunk_count}] Received {len(data)} bytes from K10 ({addr[0]})")
                 send_to_k10(data)
-                time.sleep(0.2)
+                time.sleep(1.0)  # Allow K10 speaker time to play chunk
     except KeyboardInterrupt:
         print("\nStopping Echo Test...")
 
