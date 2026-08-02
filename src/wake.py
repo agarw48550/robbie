@@ -21,6 +21,7 @@ from config.settings import (
     log,
 )
 from src.audio import chunk_rms, pcm16_to_wav_bytes
+from src.audio_routing import log_audio_routing
 from src.bridge import pick_fallback_serial, send_robot_action, serial_command_to_action
 from src.persistence import write_voice_mode_file
 from src.state import SharedState
@@ -65,6 +66,7 @@ async def _clip_contains_wake_word(client: genai.Client, wav_bytes: bytes) -> bo
 async def wake_word_task(shared: SharedState) -> None:
     """When voice is OFF, listen for 'Robbie' and flip voice mode on."""
     log.info("Wake-word listener ready (say 'Robbie' in proactive mode)")
+    log_audio_routing("wake")
     loop = asyncio.get_running_loop()
     audio_q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=64)
     last_wake = 0.0

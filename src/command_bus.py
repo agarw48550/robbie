@@ -1,11 +1,7 @@
-"""Command bus — internal action events → ESP32 JSON HTTP messages."""
+"""Command bus — internal action events → ESP32 JSON via Transport."""
 
 from __future__ import annotations
 
-import asyncio
-import json
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -13,36 +9,27 @@ from config.settings import OUTPUT_SAMPLE_RATE, log
 from src.actions import action_key, build_robot_action
 from src.audio import encode_audio_wav_b64
 from src.events import EVT_ROBOT_ACTION, Event, EventBus
-from src.persistence import load_bridge_config
 from src.state import SharedState
-
-
-def _post_json_sync(url: str, body: bytes, timeout_s: float, token: str) -> bool:
-    req = urllib.request.Request(url, data=body, method="POST")
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return 200 <= resp.status < 300
-    except urllib.error.HTTPError as exc:
-        log.error("Bridge POST HTTP %s: %s", exc.code, exc.reason)
-        return False
-    except urllib.error.URLError as exc:
-        log.error("Bridge POST failed: %s", exc.reason)
-        return False
-    except Exception as exc:
-        log.error("Bridge POST failed: %s", exc)
-        return False
+from src.transport import Transport
 
 
 class CommandBus:
-    """Converts ``robot.action`` events (and direct calls) into ESP32 JSON POSTs."""
+    """Converts ``robot.action`` events (and direct calls) into body JSON sends."""
 
-    def __init__(self, bus: EventBus, shared: SharedState) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        shared: SharedState,
+        transport: Transport,
+    ) -> None:
         self._bus = bus
         self._shared = shared
+        self._transport = transport
         bus.subscribe(EVT_ROBOT_ACTION, self._on_action_event)
+
+    @property
+    def transport(self) -> Transport:
+        return self._transport
 
     async def _on_action_event(self, event: Event) -> None:
         payload = event.payload
@@ -103,11 +90,6 @@ class CommandBus:
             )
             return False
 
-        bridge = load_bridge_config()
-        if not bridge["bridge_url"]:
-            log.warning("robot action skipped — no bridge_url configured")
-            return False
-
         shared = self._shared
         async with shared.bridge_lock:
             audio_b64: Optional[str] = None
@@ -126,19 +108,12 @@ class CommandBus:
                 audio_b64=audio_b64,
             )
             assert payload is not None
-            body = json.dumps(payload).encode("utf-8")
-            ok = await asyncio.to_thread(
-                _post_json_sync,
-                bridge["bridge_url"],
-                body,
-                bridge["bridge_timeout_s"],
-                bridge["bridge_token"],
-            )
+            ok = await self._transport.send(payload)
 
         if ok:
             shared.recent_actions.append(action_key(action))
             log.info(
-                "Bridge POST ok: %s source=%s audio=%s",
+                "Bridge send ok: %s source=%s audio=%s",
                 action_key(action),
                 source,
                 "yes" if audio_b64 else "no",

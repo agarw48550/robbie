@@ -9,11 +9,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
+    from src.body_controller import BodyController
     from src.command_bus import CommandBus
     from src.emotion_engine import EmotionEngine
     from src.events import EventBus
     from src.robot_state import RobotStateMachine
     from src.scheduler import Scheduler
+    from src.transport import Transport
 
 
 @dataclass
@@ -43,3 +45,5 @@ class SharedState:
     emotion_engine: Optional["EmotionEngine"] = None
     command_bus: Optional["CommandBus"] = None
     state_machine: Optional["RobotStateMachine"] = None
+    transport: Optional["Transport"] = None
+    body_controller: Optional["BodyController"] = None

@@ -7,7 +7,9 @@ from typing import Any
 from google.genai import types
 
 from config.settings import VALID_VOICES, log
-from src.bridge import build_robot_action, send_robot_action
+from src.actions import build_robot_action
+from src.bridge import send_robot_action
+from src.gemini.intentions import build_intention, publish_intention
 from src.persistence import remember_fact, set_voice_name, write_voice_mode_file
 from src.state import SharedState
 
@@ -133,15 +135,41 @@ async def handle_live_tool(
         )
         if not action:
             return {"ok": False, "error": "invalid movement args"}
-        ok = await send_robot_action(
-            shared,
-            direction=action["direction"],
-            duration_seconds=action["duration_seconds"],
-            speed=action["speed"],
-            expression=action["expression"],
-            source="live_tool",
-            transcript=shared.last_model_transcript,
-        )
+
+        # Prefer BodyController → intention bus → legacy bridge send
+        body = getattr(shared, "body_controller", None)
+        if body is not None:
+            ok = await body.execute_action(
+                direction=action["direction"],
+                duration_seconds=action["duration_seconds"],
+                speed=action["speed"],
+                expression=action["expression"],
+                source="live_tool",
+                transcript=shared.last_model_transcript,
+            )
+        elif shared.event_bus is not None:
+            await publish_intention(
+                shared.event_bus,
+                build_intention(
+                    direction=action["direction"],
+                    duration_seconds=action["duration_seconds"],
+                    speed=action["speed"],
+                    expression=action["expression"],
+                    source="live_tool",
+                    transcript=shared.last_model_transcript,
+                ),
+            )
+            ok = True
+        else:
+            ok = await send_robot_action(
+                shared,
+                direction=action["direction"],
+                duration_seconds=action["duration_seconds"],
+                speed=action["speed"],
+                expression=action["expression"],
+                source="live_tool",
+                transcript=shared.last_model_transcript,
+            )
         shared.tool_moved_this_turn = True
         return {"ok": ok, "action": action}
 

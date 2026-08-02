@@ -6,6 +6,7 @@ import asyncio
 
 from config.settings import VOICE_POLL_S, log
 from src.persistence import get_voice_name, read_voice_mode_file
+from src.robot_state import RobotState
 from src.state import SharedState
 
 
@@ -13,9 +14,13 @@ async def control_watcher(shared: SharedState) -> None:
     if read_voice_mode_file():
         shared.voice_enabled.set()
         log.info("Voice mode: ON")
+        if shared.state_machine is not None:
+            shared.state_machine.set_state_nowait(RobotState.LISTENING, reason="voice_on")
     else:
         shared.voice_enabled.clear()
         log.info("Voice mode: OFF (proactive-only)")
+        if shared.state_machine is not None:
+            shared.state_machine.set_state_nowait(RobotState.SLEEPING, reason="voice_off")
     shared.voice_name = get_voice_name()
     log.info("Speaking voice: %s", shared.voice_name)
 
@@ -24,9 +29,13 @@ async def control_watcher(shared: SharedState) -> None:
         if enabled and not shared.voice_enabled.is_set():
             shared.voice_enabled.set()
             log.info("Voice mode enabled")
+            if shared.state_machine is not None:
+                shared.state_machine.set_state_nowait(RobotState.LISTENING, reason="voice_on")
         elif not enabled and shared.voice_enabled.is_set():
             shared.voice_enabled.clear()
             log.info("Voice mode disabled — closing Live")
+            if shared.state_machine is not None:
+                shared.state_machine.set_state_nowait(RobotState.SLEEPING, reason="voice_off")
 
         voice = get_voice_name()
         if voice != shared.voice_name:

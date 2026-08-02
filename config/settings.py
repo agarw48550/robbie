@@ -19,6 +19,12 @@ CONFIG_DIR = Path.home() / ".config" / "robbie"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 VOICE_MODE_PATH = CONFIG_DIR / "voice_mode"  # "on" | "off"
 MEMORY_PATH = CONFIG_DIR / "memory.json"
+DB_PATH = CONFIG_DIR / "robbie.db"
+
+# Gated K10 mic/wake/playback cutover (default OFF — Pi sounddevice stays active).
+# When ROBBIE_BODY_AUDIO=1, code logs K10 path selection but does not remove Pi I/O
+# until WebSocket audio streaming + parity tests land. See src/audio_routing.py.
+ROBBIE_BODY_AUDIO_DEFAULT = False
 
 DEFAULT_BRIDGE_URL = "http://192.168.4.1/robot"
 DEFAULT_BRIDGE_TIMEOUT_S = 5.0

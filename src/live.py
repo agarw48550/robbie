@@ -23,12 +23,15 @@ from config.settings import (
     log,
 )
 from src.audio import append_turn_audio
+from src.audio_routing import log_audio_routing
 from src.brain import merge_transcript, schedule_reactive_brain
 from src.live_tools import handle_live_tool, live_tool_declarations
 from src.persistence import build_live_system_instruction, get_voice_name, remember_fact
+from src.robot_state import RobotState
 from src.state import SharedState
 
 
+# --- Speech / mic capture (Pi sounddevice; K10 path gated via ROBBIE_BODY_AUDIO) ---
 async def _mic_send_loop(session: Any, shared: SharedState) -> None:
     loop = asyncio.get_running_loop()
     audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=MIC_QUEUE_SIZE)
@@ -81,6 +84,7 @@ async def _mic_send_loop(session: Any, shared: SharedState) -> None:
         log.info("Microphone streaming stopped")
 
 
+# --- Conversation receive + Speech playback + Tool calling ---
 async def _receive_loop(session: Any, shared: SharedState) -> None:
     play_q: std_queue.Queue[Optional[bytes]] = std_queue.Queue(maxsize=PLAY_QUEUE_SIZE)
 
@@ -122,7 +126,7 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
                 ):
                     return
 
-                # --- Live tool calls (move / voice-off / remember / set_voice) ---
+                # --- Tool calling (move / voice-off / remember / set_voice) ---
                 tool_call = getattr(response, "tool_call", None)
                 if tool_call and getattr(tool_call, "function_calls", None):
                     function_responses = []
@@ -140,6 +144,7 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
                     await session.send_tool_response(function_responses=function_responses)
                     continue
 
+                # --- Conversation transcripts ---
                 content = getattr(response, "server_content", None)
                 if content is None:
                     continue
@@ -165,6 +170,7 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
                         )
                         log.info("Robbie said: %r", out_t.strip()[:120])
 
+                # --- Speech: model audio → local playback + turn buffer ---
                 model_turn = getattr(content, "model_turn", None)
                 if model_turn and getattr(model_turn, "parts", None):
                     for part in model_turn.parts:
@@ -173,6 +179,10 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
                             if not shared.is_playing:
                                 shared.is_playing = True
                                 log.info("Robbie speaking — half-duplex silence")
+                                if shared.state_machine is not None:
+                                    shared.state_machine.set_state_nowait(
+                                        RobotState.SPEAKING, reason="live_audio"
+                                    )
                                 # Fire motion ASAP so the body moves with the voice
                                 schedule_reactive_brain(
                                     shared,
@@ -202,6 +212,10 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
                 if getattr(content, "turn_complete", False):
                     log.info("Live turn complete")
                     shared.is_playing = False
+                    if shared.state_machine is not None and shared.voice_enabled.is_set():
+                        shared.state_machine.set_state_nowait(
+                            RobotState.LISTENING, reason="turn_complete"
+                        )
                     user_t = shared.last_user_transcript
                     model_t = shared.last_model_transcript
                     shared.last_user_transcript = ""
@@ -228,8 +242,10 @@ async def _receive_loop(session: Any, shared: SharedState) -> None:
 
 
 async def live_conversation_task(shared: SharedState) -> None:
+    """Gemini Live session supervisor (conversation + tools + speech I/O)."""
     client = shared.client
     backoff = 1.0
+    log_audio_routing("live")
 
     while not shared.shutdown.is_set():
         if not shared.voice_enabled.is_set():

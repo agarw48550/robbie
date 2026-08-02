@@ -40,6 +40,9 @@ def save_config(data: dict[str, Any]) -> None:
 
 
 def resolve_api_key() -> Optional[str]:
+    from config.env import load_dotenv_files
+
+    load_dotenv_files()
     env_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if env_key:
         return env_key.strip()
@@ -76,6 +79,8 @@ def load_bridge_config() -> dict[str, Any]:
         "bridge_url": cfg.get("bridge_url", DEFAULT_BRIDGE_URL),
         "bridge_timeout_s": float(cfg.get("bridge_timeout_s", DEFAULT_BRIDGE_TIMEOUT_S)),
         "bridge_token": (cfg.get("bridge_token") or "").strip(),
+        "bridge_transport": (cfg.get("bridge_transport") or "http").strip().lower(),
+        "bridge_ws_url": (cfg.get("bridge_ws_url") or "").strip(),
     }
 
 
@@ -107,7 +112,37 @@ def write_voice_mode_file(enabled: bool) -> None:
     VOICE_MODE_PATH.write_text("on\n" if enabled else "off\n", encoding="utf-8")
 
 
+def _mirror_facts_to_json(facts: list[dict[str, Any]]) -> None:
+    """Write-through so ``robbie memory show`` (reads memory.json) stays in sync."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    MEMORY_PATH.write_text(
+        json.dumps({"facts": facts}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _try_sqlite_store():
+    try:
+        from src.db.store import try_get_store
+
+        return try_get_store()
+    except Exception as exc:
+        log.debug("SQLite memory unavailable: %s", exc)
+        return None
+
+
 def load_memory() -> dict[str, Any]:
+    """Load facts — prefer SQLite when available, else memory.json."""
+    store = _try_sqlite_store()
+    if store is not None:
+        data = store.facts_as_memory_dict()
+        # Keep JSON mirror current for CLI parity
+        try:
+            _mirror_facts_to_json(list(data.get("facts") or []))
+        except OSError:
+            pass
+        return data
+
     if not MEMORY_PATH.exists():
         return {"facts": []}
     try:
@@ -121,14 +156,40 @@ def load_memory() -> dict[str, Any]:
 
 
 def save_memory(data: dict[str, Any]) -> None:
+    """Persist facts to JSON and SQLite (write-through both)."""
+    if not isinstance(data, dict):
+        data = {"facts": []}
+    facts = [f for f in list(data.get("facts") or []) if isinstance(f, dict)]
+    facts = facts[-MAX_MEMORY_FACTS:]
+    out = dict(data)
+    out["facts"] = facts
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    MEMORY_PATH.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    MEMORY_PATH.write_text(json.dumps(out, indent=2) + "\n", encoding="utf-8")
+
+    store = _try_sqlite_store()
+    if store is None:
+        return
+    store.clear_facts()
+    for fact in facts:
+        text = str(fact.get("text") or "").strip()
+        if not text:
+            continue
+        store.remember_fact(text, source=str(fact.get("source") or "conversation"))
 
 
 def remember_fact(text: str, source: str = "conversation") -> str:
     text = (text or "").strip()
     if not text:
         return "empty"
+
+    store = _try_sqlite_store()
+    if store is not None:
+        status = store.remember_fact(text, source=source)
+        if status == "saved":
+            _mirror_facts_to_json(store.list_facts())
+            log.info("Remembered (%s): %s", source, text[:120])
+        return status
+
     mem = load_memory()
     facts: list[dict[str, Any]] = list(mem.get("facts") or [])
     # Dedup exact matches

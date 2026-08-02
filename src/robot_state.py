@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from config.settings import log
 from src.events import EVT_STATE_CHANGED, EventBus
+
+if TYPE_CHECKING:
+    from src.state import SharedState
 
 
 class RobotState(str, Enum):
@@ -18,6 +21,10 @@ class RobotState(str, Enum):
     MOVING = "MOVING"
     SLEEPING = "SLEEPING"
     ERROR = "ERROR"
+    HAPPY = "HAPPY"
+    CONFUSED = "CONFUSED"
+    CELEBRATING = "CELEBRATING"
+    UPDATING = "UPDATING"
 
 
 class RobotStateMachine:
@@ -69,3 +76,15 @@ def parse_robot_state(value: Optional[str]) -> Optional[RobotState]:
         return RobotState(value)
     except ValueError:
         return None
+
+
+async def apply_runtime_state(
+    shared: "SharedState",
+    state: RobotState,
+    reason: str = "",
+) -> None:
+    """Set robot state via SharedState's state machine when attached."""
+    sm = getattr(shared, "state_machine", None)
+    if sm is None:
+        return
+    await sm.set_state(state, reason=reason)

@@ -27,7 +27,19 @@ async def send_robot_action(
     transcript: str = "",
     include_audio: bool = True,
 ) -> bool:
-    """Send a body command. Prefers CommandBus (event-driven OS path)."""
+    """Send a body command. Prefers BodyController, else CommandBus."""
+    body = getattr(shared, "body_controller", None)
+    if body is not None:
+        return await body.execute_action(
+            direction=direction,
+            duration_seconds=duration_seconds,
+            speed=speed,
+            expression=expression,
+            source=source,
+            transcript=transcript,
+            include_audio=include_audio,
+        )
+
     if shared.command_bus is not None:
         return await shared.command_bus.send(
             direction=direction,

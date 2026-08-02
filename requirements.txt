@@ -1,2 +1,5 @@
 google-genai
 sounddevice
+python-dotenv
+# Optional: WebSocket transport (bridge_transport=websocket). HTTP remains default.
+websockets
