@@ -1,115 +1,153 @@
 #!/usr/bin/env python3
-"""DEPRECATED — use ``main.py`` as the entry point.
+"""live_orchestrator.py — Gemini Live Audio-to-Audio Orchestrator"""
 
-This module re-exports the reorganized package so existing imports keep working:
-  from robbie_orchestrator import set_bridge_url, VALID_VOICES, ...
-"""
-
-from __future__ import annotations
-
+import os
+import sys
 import asyncio
+import socket
+import json
+import urllib.request
+import pyaudio
+from google import genai
+from google.genai import types
 
-# Re-export public API used by bin/robbie and external callers
-from config.settings import (  # noqa: F401
-    AMBIENT_RMS_THRESHOLD,
-    BRAIN_MODELS,
-    BRAIN_MODELS_FULL,
-    BRAIN_MODELS_PI,
-    BRAIN_RETRIES_PER_MODEL,
-    CHANNELS,
-    CHUNK_FRAMES,
-    CONFIG_DIR,
-    CONFIG_PATH,
-    DEFAULT_BRIDGE_TIMEOUT_S,
-    DEFAULT_BRIDGE_URL,
-    DIGIT_TO_DIR,
-    DIGIT_TO_EXPR,
-    DIR_NAME_TO_DIGIT,
-    EXPR_NAME_TO_DIGIT,
-    FALLBACK_SERIAL_COMMAND,
-    FALLBACK_SERIAL_POOL,
-    INPUT_SAMPLE_RATE,
-    IS_PI,
-    LIVE_MODEL,
-    MAX_MEMORY_FACTS,
-    MEMORY_PATH,
-    MIC_QUEUE_SIZE,
-    OUTPUT_SAMPLE_RATE,
-    PLAY_QUEUE_SIZE,
-    PROACTIVITY_INTERVAL_S,
-    REACTIVE_BRAIN_MIN_INTERVAL_S,
-    SERIAL_COMMAND_RE,
-    TURN_AUDIO_MAX_BYTES,
-    VALID_ACTION_TYPES,
-    VALID_VOICES,
-    VOICE_MODE_PATH,
-    VOICE_POLL_S,
-    WAKE_CLIP_S,
-    WAKE_COOLDOWN_S,
-    WAKE_RMS_THRESHOLD,
-    is_pi_zero,
-    log,
+# --- CONFIGURATION ---
+K10_HTTP_URL = "http://192.168.1.25:8080/robot"  # <--- Verify your K10 IP address
+UDP_PORT = 5005
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    print("ERROR: GEMINI_API_KEY environment variable not set!")
+    sys.exit(1)
+
+# PyAudio setup for local playback on Pi (or USB speaker connected to Pi)
+p = pyaudio.PyAudio()
+audio_stream = p.open(
+    format=pyaudio.paInt16,
+    channels=1,
+    rate=24000,  # Gemini Live returns 24kHz audio
+    output=True
 )
-from src.app import main  # noqa: F401
-from src.audio import (  # noqa: F401
-    append_turn_audio,
-    encode_audio_wav_b64,
-    pcm16_to_wav_bytes,
-)
-from src.audio import chunk_rms as _chunk_rms  # noqa: F401
-from src.brain import (  # noqa: F401
-    PROTOCOL_BLOCK,
-    JSON_SCHEMA_BLOCK,
-    build_brain_prompt_idle,
-    build_brain_prompt_reactive,
-    call_brain,
-    execute_brain_decision,
-    merge_transcript,
-    parse_brain_response,
-    schedule_reactive_brain,
-)
-from src.bridge import (  # noqa: F401
-    action_key,
-    build_robot_action,
-    build_serial_command,
-    is_valid_serial_command,
-    pick_fallback_serial,
-    send_robot_action,
-    send_robot_action_from_serial,
-    serial_command_to_action,
-)
-from src.control import control_watcher  # noqa: F401
-from src.live import live_conversation_task  # noqa: F401
-from src.live_tools import handle_live_tool, live_tool_declarations  # noqa: F401
-from src.persistence import (  # noqa: F401
-    build_live_system_instruction,
-    get_voice_name,
-    load_bridge_config,
-    load_config,
-    load_memory,
-    memory_summary_for_prompt,
-    read_voice_mode_file,
-    remember_fact,
-    resolve_api_key,
-    save_config,
-    save_memory,
-    set_bridge_url,
-    set_voice_name,
-    write_voice_mode_file,
-)
-from src.proactivity import proactivity_task  # noqa: F401
-from src.state import SharedState  # noqa: F401
-from src.wake import WAKE_PATTERNS, wake_word_task  # noqa: F401
+
+def send_k10_action(expression="happy", direction="stop", duration=0, speed=5):
+    """Sends lightweight action JSON payload to K10."""
+    payload = json.dumps({
+        "expression": expression,
+        "direction": direction,
+        "duration": duration,
+        "speed": speed
+    }).encode('utf-8')
+
+    req = urllib.request.Request(
+        K10_HTTP_URL,
+        data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            print(f"[Action Executed] {expression} | {direction} for {duration}s")
+    except Exception as e:
+        print(f"[Action Failed]: {e}")
+
+# Tool definition so Gemini can trigger physical movements
+robot_tools = [{
+    "function_declarations": [
+        {
+            "name": "control_robot",
+            "description": "Control the physical movement and screen expression of Robbie the robot.",
+            "parameters": {
+                "type": "OBJECT",
+                "properties": {
+                    "expression": {
+                        "type": "STRING",
+                        "description": "Screen expression: happy, sad, curious, angry, calm, surprised"
+                    },
+                    "direction": {
+                        "type": "STRING",
+                        "description": "Motor direction: forward, backward, spin_left, spin_right, stop"
+                    },
+                    "duration": {
+                        "type": "NUMBER",
+                        "description": "Duration in seconds (e.g. 1.5)"
+                    }
+                },
+                "required": ["expression"]
+            }
+        }
+    ]
+}]
+
+async def udp_audio_receiver(session, loop):
+    """Receives UDP chunks from UNIHIKER K10 and forwards them to Gemini Live."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("0.0.0.0", UDP_PORT))
+    sock.setblocking(False)
+    print(f"UDP Audio Receiver listening on port {UDP_PORT}...")
+
+    while True:
+        try:
+            data, _ = await loop.sock_recvfrom(sock, 65535)
+            if data:
+                # Send raw audio directly into Gemini Live WebSocket
+                await session.send(input={"data": data, "mime_type": "audio/pcm;rate=16000"})
+        except Exception:
+            await asyncio.sleep(0.01)
+
+async def gemini_response_listener(session):
+    """Listens for returning audio stream and tool calls from Gemini Live."""
+    async for response in session.receive():
+        server_content = response.server_content
+        if server_content and server_content.model_turn:
+            for part in server_content.model_turn.parts:
+                # Real-time returning PCM audio from Gemini
+                if part.inline_data:
+                    audio_stream.write(part.inline_data.data)
+
+        # Handle Gemini Live tool calls for motion/expression
+        if response.tool_call:
+            for call in response.tool_call.function_calls:
+                if call.name == "control_robot":
+                    args = call.args
+                    send_k10_action(
+                        expression=args.get("expression", "happy"),
+                        direction=args.get("direction", "stop"),
+                        duration=args.get("duration", 0)
+                    )
+
+async def main():
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    loop = asyncio.get_running_loop()
+
+    config = types.LiveConnectConfig(
+        response_modalities=[types.LiveModality.AUDIO],  # Audio-to-audio mode!
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(name="Puck")
+            )
+        ),
+        tools=robot_tools,
+        system_instruction=types.Content(
+            parts=[types.Part.from_text(
+                "You are Robbie, an expressive desktop pet robot. Respond with short, friendly speech. "
+                "Use the control_robot function tool frequently during conversation to trigger expressions and movements."
+            )]
+        )
+    )
+
+    print("Connecting to Gemini Live (Audio-to-Audio)...")
+    async with client.aio.live.connect(model="gemini-2.0-flash-exp", config=config) as session:
+        print("Connected to Gemini Live!")
+        await asyncio.gather(
+            udp_audio_receiver(session, loop),
+            gemini_response_listener(session)
+        )
 
 if __name__ == "__main__":
-    import warnings
-
-    warnings.warn(
-        "robbie_orchestrator.py is deprecated; run main.py instead",
-        DeprecationWarning,
-        stacklevel=1,
-    )
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("Interrupted — shutting down")
+        print("\nShutting down Robbie Live Orchestrator.")
+        audio_stream.stop_stream()
+        audio_stream.close()
+        p.terminate()
